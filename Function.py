@@ -110,7 +110,7 @@ def fitness(params, env_params):
         integrand_values.append(integrand)
 
     # Используем метод трапеций вместо простого суммирования
-    total_fitness = integrate.trapezoid(integrand_values, t)  # ИЗМЕНИЛИ trapz на trapezoid
+    total_fitness = integrate.trapezoid(integrand_values, t)
 
     return -total_fitness  # Возвращаем -F для минимизации
 
@@ -168,7 +168,174 @@ def determine_behavior_class(b_optimal, grayzone_min, grayzone_max):
         return 1, "Есть миграция"
 
 # =============================================================================
-# БЛОК 7: ГЕНЕРАЦИЯ ВЫБОРКИ ДЛЯ НЕЙРОННОЙ СЕТИ (ИЗМЕНЕННЫЙ)
+# БЛОК 7: УЛУЧШЕННАЯ СИСТЕМА БАЛАНСИРОВКИ КЛАССОВ
+# =============================================================================
+
+class BalancedDatasetGenerator:
+    """Класс для интеллектуальной генерации сбалансированного датасета"""
+    
+    def __init__(self):
+        # Используем оригинальные диапазоны, но смещаем распределение для каждого класса
+        self.class_biases = {
+            0: {  # Нет миграции - смещаем в сторону высокого риска/стоимости
+                "sigma2_bias": 0.7,    # 70% к верхней границе риска
+                "beta_bias": 0.8,      # 80% к верхней границе стоимости
+                "sigma1_bias": 0.3,    # 30% к верхней границе еды (меньше стимула)
+                "gamma_bias": 0.8      # 80% к верхней границе чувствительности
+            },
+            1: {  # Есть миграция - смещаем в сторону низкого риска/стоимости
+                "sigma2_bias": 0.3,    # 30% к верхней границе риска  
+                "beta_bias": 0.2,      # 20% к верхней границе стоимости
+                "sigma1_bias": 0.7,    # 70% к верхней границе еды (больше стимула)
+                "gamma_bias": 0.3      # 30% к верхней границе чувствительности
+            },
+            0.5: {  # Серая зона - баланс вокруг середины
+                "sigma2_bias": 0.5,    # 50% - средние значения
+                "beta_bias": 0.5,      # 50% - средние значения
+                "sigma1_bias": 0.5,    # 50% - средние значения
+                "gamma_bias": 0.5      # 50% - средние значения
+            }
+        }
+    
+    def generate_balanced_dataset(self, num_samples=1000, save_path="migration_dataset_balanced.pkl"):
+        """Основной метод генерации сбалансированного датасета"""
+        dataset = self._initialize_dataset()
+        
+        print(f"🎯 Генерация сбалансированной выборки: {num_samples} образцов")
+        target_counts = self._calculate_target_distribution(num_samples)
+        
+        # Генерация для каждого класса
+        for target_class in [0, 0.5, 1]:
+            self._generate_class_samples(target_class, target_counts[target_class], dataset)
+        
+        return self._finalize_dataset(dataset, save_path)
+    
+    def _generate_class_samples(self, target_class, target_count, dataset):
+        """Генерация образцов для конкретного класса"""
+        print(f"\n📊 Генерация класса {target_class}...")
+        generated = 0
+        attempts = 0
+        max_attempts = target_count * 20
+        
+        while generated < target_count and attempts < max_attempts:
+            attempts += 1
+            
+            if attempts % 20 == 0:
+                success_rate = (generated / attempts) * 100 if attempts > 0 else 0
+                print(f"  Попытка {attempts}, сгенерировано {generated}/{target_count} (успех: {success_rate:.1f}%)")
+            
+            env = self._apply_class_bias(target_class, generate_environment())
+            A_opt, b_opt, F_opt, result = find_global_optimum(env)
+            
+            if result.success:
+                behavior_class, behavior_name = determine_behavior_class(
+                    b_opt, env["grayzone_min"], env["grayzone_max"])
+                
+                if behavior_class == target_class:
+                    self._add_sample_to_dataset(dataset, env, A_opt, b_opt, F_opt, behavior_class, behavior_name, result)
+                    generated += 1
+                elif attempts % 25 == 0:
+                    # Диагностика: почему не получился нужный класс
+                    print(f"    Получен класс {behavior_class} вместо {target_class}, b*={b_opt:.2f}")
+                    print(f"    Параметры: sigma1={env['sigma1']:.2f}, sigma2={env['sigma2']:.2f}, beta={env['beta']:.2e}, gamma={env['gamma']:.2f}")
+        
+        print(f"  ✅ Класс {target_class}: {generated}/{target_count} (попыток: {attempts})")
+    
+    def _apply_class_bias(self, target_class, env):
+        """Применяем смещение параметров для целевого класса, сохраняя оригинальные диапазоны"""
+        biases = self.class_biases[target_class]
+        
+        # Оригинальные диапазоны
+        original_ranges = {
+            "sigma1": (0.25, 8.61),
+            "sigma2": (0.003, 8.99), 
+            "beta": (1e-9, 0.001),
+            "gamma": (0.001, 1000)
+        }
+        
+        # Применяем смещение в рамках оригинальных диапазонов
+        for param, bias in biases.items():
+            param_name = param.replace("_bias", "")
+            low, high = original_ranges[param_name]
+            
+            if bias < 0.5:
+                # Смещаем к нижней границе
+                new_low = low
+                new_high = low + (high - low) * (bias * 2)
+            else:
+                # Смещаем к верхней границе  
+                new_low = low + (high - low) * ((bias - 0.5) * 2)
+                new_high = high
+            
+            # Генерируем значение в смещенном диапазоне
+            if param_name == "beta":  # логарифмический масштаб для beta
+                log_low = np.log10(new_low)
+                log_high = np.log10(new_high)
+                env[param_name] = 10 ** np.random.uniform(log_low, log_high)
+            else:
+                env[param_name] = np.random.uniform(new_low, new_high)
+        
+        return env
+
+    # Остальные методы остаются без изменений...
+    def _initialize_dataset(self):
+        return {
+            'features': [], 'targets': [], 'behavior_names': [],
+            'env_params': [], 'optimization_info': []
+        }
+    
+    def _calculate_target_distribution(self, num_samples):
+        samples_per_class = num_samples // 3
+        remaining = num_samples % 3
+        return {
+            0: samples_per_class + (1 if remaining >= 1 else 0),
+            0.5: samples_per_class + (1 if remaining >= 2 else 0),
+            1: samples_per_class
+        }
+    
+    def _add_sample_to_dataset(self, dataset, env, A_opt, b_opt, F_opt, behavior_class, behavior_name, result):
+        features = [env["sigma1"], env["xi1"], env["sigma2"], env["xi2"],
+                   env["xi3"], env["xi4"], env["eta1"], env["eta2"], env["c3"], env["c4"]]
+        
+        dataset['features'].append(features)
+        dataset['targets'].append([A_opt, b_opt, F_opt, behavior_class])
+        dataset['behavior_names'].append(behavior_name)
+        dataset['env_params'].append(env)
+        dataset['optimization_info'].append({
+            'success': result.success, 'message': result.message,
+            'nfev': result.nfev, 'nit': result.nit
+        })
+    
+    def _finalize_dataset(self, dataset, save_path):
+        if len(dataset['features']) > 0:
+            dataset['features'] = np.array(dataset['features'])
+            dataset['targets'] = np.array(dataset['targets'])
+        else:
+            print("⚠️ Внимание: не удалось сгенерировать ни одного образца!")
+            dataset['features'] = np.array([])
+            dataset['targets'] = np.array([])
+        
+        with open(save_path, 'wb') as f:
+            pickle.dump(dataset, f)
+        
+        csv_path = save_path.replace('.pkl', '.csv')
+        save_dataset_csv(dataset, csv_path)
+        
+        print(f"\n🎉 Датсет сохранен:")
+        print(f"   📁 Pickle: {save_path}")
+        print(f"   📁 CSV: {csv_path}")
+        
+        return dataset
+
+# Создаем глобальный экземпляр генератора
+balanced_generator = BalancedDatasetGenerator()
+
+def generate_balanced_dataset(num_samples=1000, save_path="migration_dataset_balanced.pkl"):
+    """Улучшенная генерация сбалансированного датасета"""
+    return balanced_generator.generate_balanced_dataset(num_samples, save_path)
+
+# =============================================================================
+# БЛОК 8: БАЗОВАЯ ГЕНЕРАЦИЯ ВЫБОРКИ
 # =============================================================================
 
 def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl"):
@@ -177,13 +344,12 @@ def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl
     Только параметры среды в признаках, коэффициенты организма исключены
     """
 
-    # Структура для хранения данных
     dataset = {
-        'features': [],      # Только параметры среды (без a, gamma, beta, lambda_Q)
+        'features': [],      # Только параметры среды
         'targets': [],       # Целевые переменные [A_opt, b_opt, fitness, class]
-        'behavior_names': [], # Названия классов поведения
-        'env_params': [],     # Полные параметры среды для отладки
-        'optimization_info': []  # Информация об оптимизации
+        'behavior_names': [], 
+        'env_params': [],    
+        'optimization_info': []
     }
 
     print(f"Генерация {num_samples} образцов данных методом глобальной оптимизации...")
@@ -198,7 +364,7 @@ def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl
         # Генерация среды
         env = generate_environment()
 
-        # ГЛОБАЛЬНАЯ оптимизация для нахождения оптимальной стратегии
+        # Глобальная оптимизация
         A_opt, b_opt, F_opt, result = find_global_optimum(env)
 
         if result.success:
@@ -213,7 +379,6 @@ def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl
             env["sigma1"], env["xi1"], env["sigma2"], env["xi2"],
             env["xi3"], env["xi4"], env["eta1"], env["eta2"],
             env["c3"], env["c4"]
-            # Исключены: a, gamma, beta, lambda_Q
         ]
 
         # Формирование целевых переменных
@@ -234,7 +399,7 @@ def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl
         dataset['env_params'].append(env)
         dataset['optimization_info'].append(opt_info)
 
-    # Преобразование в numpy массивы для удобства
+    # Преобразование в numpy массивы
     dataset['features'] = np.array(dataset['features'])
     dataset['targets'] = np.array(dataset['targets'])
 
@@ -247,11 +412,15 @@ def generate_training_dataset(num_samples=1000, save_path="migration_dataset.pkl
     with open(save_path, 'wb') as f:
         pickle.dump(dataset, f)
 
-    # Сохраняем в CSV (только один файл, правильный для Excel)
+    # Сохраняем в CSV
     csv_path = save_path.replace('.pkl', '.csv')
     save_dataset_csv(dataset, csv_path)
 
     return dataset
+
+# =============================================================================
+# БЛОК 9: АНАЛИЗ И ВИЗУАЛИЗАЦИЯ ДАННЫХ
+# =============================================================================
 
 def analyze_dataset(dataset):
     """
@@ -275,7 +444,7 @@ def analyze_dataset(dataset):
     print(f"Успешных оптимизаций: {success_count}/{len(optimization_info)} ({success_count/len(optimization_info)*100:.1f}%)")
 
     # Анализ классов поведения
-    behavior_classes = targets[:, 3]  # 4-й столбец - класс поведения
+    behavior_classes = targets[:, 3]
     unique_classes, class_counts = np.unique(behavior_classes, return_counts=True)
 
     print(f"\nРаспределение классов поведения:")
@@ -342,29 +511,21 @@ def plot_dataset_distribution(dataset):
     plt.tight_layout()
     plt.show()
 
-# =============================================================================
-# БЛОК 8: СОХРАНЕНИЕ В CSV
-# =============================================================================
-
 def save_dataset_csv(dataset, csv_path="migration_dataset.csv"):
     """Сохраняет датасет в CSV формате для Excel"""
     with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
-        # Используем точку с запятой как разделитель для Excel
         writer = csv.writer(f, delimiter=';')
 
-        # Заголовки столбцов (ТОЛЬКО параметры среды в признаках)
         headers = [
             'sigma1', 'xi1', 'sigma2', 'xi2', 'xi3', 'xi4', 'eta1', 'eta2',
-            'c3', 'c4',  # Только параметры среды
-            'A_optimal', 'b_optimal', 'fitness_optimal', 'behavior_class', 'behavior_name'
+            'c3', 'c4', 'A_optimal', 'b_optimal', 'fitness_optimal', 'behavior_class', 'behavior_name'
         ]
         writer.writerow(headers)
 
-        # Данные
         for i in range(len(dataset['features'])):
             row = (
-                list(dataset['features'][i]) +  # Только параметры среды
-                list(dataset['targets'][i]) +   # A_opt, b_opt, fitness, class
+                list(dataset['features'][i]) +
+                list(dataset['targets'][i]) +
                 [dataset['behavior_names'][i]]
             )
             writer.writerow(row)
@@ -373,7 +534,7 @@ def save_dataset_csv(dataset, csv_path="migration_dataset.csv"):
     print("Примечание: В признаки включены только параметры среды (10 параметров)")
 
 # =============================================================================
-# БЛОК 9: ДЕМОНСТРАЦИЯ ГЛОБАЛЬНОЙ ОПТИМИЗАЦИИ
+# БЛОК 10: ДЕМОНСТРАЦИЯ ГЛОБАЛЬНОЙ ОПТИМИЗАЦИИ
 # =============================================================================
 
 def demonstrate_global_optimization():
@@ -413,7 +574,7 @@ def demonstrate_global_optimization():
     return env, A_opt, b_opt, F_opt, result
 
 # =============================================================================
-# БЛОК 10: ОСНОВНАЯ ПРОГРАММА
+# БЛОК 11: ОСНОВНАЯ ПРОГРАММА
 # =============================================================================
 
 def main():
@@ -430,11 +591,25 @@ def main():
 
     print("\n" + "=" * 60)
 
-    # Генерация полного датасета
-    dataset = generate_training_dataset(
-        num_samples=10,  # Можно увеличить для финального датасета
-        save_path="migration_dataset_global.pkl"
-    )
+    # Выбор типа генерации
+    print("Выберите тип генерации:")
+    print("1 - Балансированная генерация (рекомендуется)")
+    print("2 - Базовая генерация")
+    
+    choice = input("Введите номер (1 или 2): ").strip()
+    
+    if choice == "1":
+        # Генерация сбалансированного датасета
+        dataset = generate_balanced_dataset(
+            num_samples=30,  # 10 на класс
+            save_path="migration_dataset_balanced.pkl"
+        )
+    else:
+        # Генерация базового датасета
+        dataset = generate_training_dataset(
+            num_samples=30,
+            save_path="migration_dataset_base.pkl"
+        )
 
     # Анализ датасета
     analyze_dataset(dataset)
@@ -449,13 +624,6 @@ def main():
     print(f"  ИСКЛЮЧЕНЫ: a, gamma, beta, lambda_Q")
     print(f"Целевые переменные (targets): массив размерности {dataset['targets'].shape}")
     print(f"  Столбцы: A_optimal, b_optimal, fitness_optimal, behavior_class")
-
-    # Пример доступа к данным:
-    print(f"\nПример первого образца:")
-    print(f"Признаки (только среда): {dataset['features'][0]}")
-    print(f"Цели: {dataset['targets'][0]}")
-    print(f"Класс поведения: {dataset['behavior_names'][0]}")
-
 
 if __name__ == "__main__":
     main()
